@@ -1,197 +1,287 @@
-# MLE Take-Home: Company Recommendation System
+# OneCredit MLE Take-Home: Company Recommendation Service
 
-Welcome to the **Machine Learning Engineer** take-home from the OneCredit Data & AI team. It's a simplified version of
-a system we run in production, where it powers company recommendations and lead generation.
+Content-based **"Similar companies"** recommendation service built for OneCredit's portal (`mle-v2026.11`). It consumes noisy, multilingual, at-least-once company events from RabbitMQ (`company-events`), embeds business descriptions locally on CPU with an open-source ONNX model, stores company state and 384-dimensional vectors in PostgreSQL (`pgvector`), and serves low-latency nearest-neighbor recommendations via FastAPI.
 
-**Who it's for:** people early in their career, with 0 to 2 years of experience. Fresh graduates are welcome.
+See [`DESIGN.md`](DESIGN.md) for architectural decisions, messy-feed policies, measured multilingual vs. English-only retrieval results, 10x scaling plan, limitations, and AI-usage disclosure.
 
-If you applied, thanks for your time. If you didn't, we hope this helps you learn something new, such as RabbitMQ or
-pgvector.
+---
 
-Assessment version: **2026.11** (`mle-v2026.11`). What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
+## Architecture Overview
 
-## The scenario
-
-When someone opens a company's page on the OneCredit portal, we want to show a **"Similar companies"** panel next to
-it. Someone looking at a coffee shop chain in Selangor should see other companies that do similar things.
-
-The registry team already publishes every company change to a RabbitMQ queue. Your job is to build the service that
-powers that panel from the feed.
-
-### What the user sees
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  OneCredit Portal                                         Search companies…  │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Sinar Teguh Bakery Sdn. Bhd.                                   SYN-001550   │
-│  Food & Beverage · Selangor                                                  │
-│  Operating cafes and coffee shops in the Klang Valley                        │
-│                                                                              │
-│  Similar companies                                                           │
-│  ┌────────────────────────────────────┐  ┌────────────────────────────────┐  │
-│  │ Seri Sejahtera Food Sdn. Bhd.      │  │ Everbright Pacific Food        │  │
-│  │ Food & Beverage · Johor            │  │ Sdn. Bhd.                      │  │
-│  │                                    │  │ Food & Beverage · Kuala Lumpur │  │
-│  └────────────────────────────────────┘  └────────────────────────────────┘  │
-│  ┌────────────────────────────────────┐  ┌────────────────────────────────┐  │
-│  │ Gemilang Delima Food Sdn. Bhd.     │  │ Pacific Everbright Logistik    │  │
-│  │ Food & Beverage · Johor            │  │ PLT                            │  │
-│  │                                    │  │ Logistics · Kuala Lumpur       │  │
-│  └────────────────────────────────────┘  └────────────────────────────────┘  │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+```text
+producer/publish.py (data/feed.jsonl)
+        │  durable queue: company-events (no extra args)
+        ▼
+    RabbitMQ  ──►  app.consumer (aio-pika + FastEmbed ONNX CPU, loaded once)
+                        │  atomic conditional upsert + commit-before-ACK
+                        │  malformed events -> ingestion_errors
+                        ▼
+               PostgreSQL + pgvector
+                        ▲
+                        │  exact cosine search (<=>), inference-free
+                        │
+                app.api (FastAPI)  ◄──  OneCredit Portal / curl
 ```
 
-Clicking a card opens that company's page, with its own "Similar companies" panel.
+---
 
-### How it works for the user
+## Prerequisites
 
-```mermaid
-sequenceDiagram
-    actor User as Portal user
-    participant Portal as OneCredit portal
-    participant Service as Your service
-    participant DB as Postgres + pgvector
-    User->>Portal: Opens the page for SYN-001550
-    Portal->>Service: Similar companies for SYN-001550
-    Service->>DB: Nearest neighbours of SYN-001550
-    DB-->>Service: Closest companies
-    Service-->>Portal: Similar companies, most similar first
-    Portal-->>User: Page with the "Similar companies" panel
-    User->>Portal: Clicks Seri Sejahtera Food Sdn. Bhd.
-    Portal->>Service: Similar companies for SYN-000539
-```
+- **Docker** (with Docker Compose) for PostgreSQL (`pgvector/pgvector:0.8.7-pg16`) and RabbitMQ (`rabbitmq:3.13.7-management`)
+- **[`uv`](https://docs.astral.sh/uv/)** (manages Python 3.14 and locked dependencies automatically)
+- **[`just`](https://github.com/casey/just)** *(optional — every `just` target has a direct command equivalent below)*
 
-### How the data gets there
+> **First-run model download:** On its first start, the consumer downloads the open-source quantized ONNX model `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (~220 MB) via `fastembed` into the local Hugging Face cache. No paid API keys or external services are required.
 
-```mermaid
-flowchart LR
-    P[Registry feed<br/>producer] -->|company-events| Q[(RabbitMQ)]
-    Q --> C[Your consumer]
-    C -->|embed descriptions| E[Embedding model]
-    C --> D[(Postgres + pgvector<br/>similarity search)]
-    A[Your service] --> D
-    W[OneCredit portal] --> A
-```
+---
 
-### Notes from the registry team
+## Quick Start
 
-> The feed merges a few upstream sources and we don't validate what they send. Delivery is at-least-once, and every
-> message has an AMQP `message_id`. Each event carries the time the change happened at the source in `updatedAt`. We own
-> the `company-events` queue and declare it as durable with no extra arguments. We can't change the format before your
-> launch, so please work with what's there.
-
-### What the portal needs
-
-- Recommendations that reflect the latest information we've received about each company.
-- No lost companies. If a company is in the feed, users expect to see it on the portal and in other companies'
-  recommendations.
-- Fast enough to render while the company page loads.
-
-## The task
-
-1. Build a **consumer** that reads the `company-events` queue and stores each company in Postgres, with an embedding
-   of its business description in pgvector.
-2. Build the **service** the portal calls: given a company, return its most similar companies, with what the portal
-   needs to draw each card in the mock above. Run the similarity search in Postgres with pgvector. Matching companies
-   on their nature of business is enough for a first version.
-3. Write a short `DESIGN.md` covering the decisions you made, the assumptions you made where the scenario was unclear,
-   what you would change to handle 10x the volume, and what's left.
-4. Optional, up to one hour of your six: go deeper in one area you're strong in. For example: how good the
-   recommendations are, latency at a realistic scale, how you'd monitor this in production, or a design for explaining
-   a recommendation with an LLM (a design only; no paid APIs). Write it up in `DESIGN.md`.
-
-The rest is your call: the schema, the embedding model, your tests and tooling, and the API, including what the portal
-gets back when something goes wrong. Tell us in your own README how to start your consumer and service, and we'll
-follow it.
-
-Where the scenario leaves something open, make a reasonable call and write it down. There isn't one right answer.
-
-## Embeddings
-
-Use an open-source embedding model that runs on a laptop CPU. Don't call a paid API. Some options:
-
-- `BAAI/bge-small-en-v1.5`, a small CPU model (384 dimensions), through
-  [fastembed](https://qdrant.github.io/fastembed/) or sentence-transformers. The panel in the mock above comes from it.
-- A placeholder while you build, such as a hashed bag-of-words vector, as long as you say so in `DESIGN.md`.
-
-## Getting started
-
-You need Docker, [uv](https://docs.astral.sh/uv/) (it installs Python 3.14 for you) and
-[just](https://github.com/casey/just). Setup takes about 5 minutes and doesn't count towards your time.
+### 1. Install dependencies & start infrastructure
 
 ```bash
-just setup      # install the producer's dependencies
-just up         # start Postgres (with pgvector) and RabbitMQ
-just publish    # publish the registry feed to the queue
-just down       # stop everything and delete the data
+just setup          # or: uv sync --locked
+just up             # or: docker compose up -d --wait
 ```
 
-Postgres is at `postgresql://postgres:postgres@localhost:5432/companies`, and the RabbitMQ management UI is at
-http://localhost:15672 (user `guest`, password `guest`). If those ports are taken on your machine, export
-`POSTGRES_PORT`, `RABBITMQ_PORT` or `RABBITMQ_UI_PORT` in your shell before `just up`; `just publish` uses the same
-`RABBITMQ_PORT`.
+### 2. Apply database schema migration (one-time, idempotent)
 
-`just publish` sends the whole feed every time you run it. To start again from an empty queue and database, run
-`just down` and then `just up`.
-
-## What's already here
-
-```
-.
-├── data/feed.jsonl        # the registry feed: 2,518 messages about 2,000 synthetic Malaysian companies, duplicates included
-├── producer/publish.py    # replays the feed onto the queue
-├── docker-compose.yml     # Postgres with pgvector, and RabbitMQ
-└── Justfile               # setup, up, publish, down
+```bash
+uv run python -m app.database
 ```
 
-Add whatever else you need (`uv add` for libraries).
+*(The consumer also runs this idempotent migration on startup.)*
 
-## How to submit
+### 3. Start the consumer (Terminal A)
 
-1. Click **Use this template** → **Create a new repository**, and make it **public**. Any name is fine.
-2. Build your solution in your copy, with `DESIGN.md` at the top level.
-3. When you're done, fill in the [submission form](https://docs.google.com/forms/d/e/1FAIpQLSdjCsXP5jFrKrIi4krLVS8Sq0rhM4mLlhycpsAo34sSj4h3FA/viewform) with a link to your repo and your résumé.
+```bash
+uv run python -m app.consumer
+```
 
-If the setup itself is broken (Docker, the services or the data won't start), open a
-[Setup problem](https://github.com/OneCreditMY/mle-take-home/issues/new?template=setup-problem.yml) issue. Issues are public, so don't put your
-solution or personal details in one.
+### 4. Start the similarity API (Terminal B)
 
-## Time
+```bash
+uv run uvicorn app.api:app --host 127.0.0.1 --port 8000
+```
 
-Plan for **4 to 6 hours**, within 7 days of creating your copy, and stop at 6 hours. If you run out of time,
-write down what you'd do next. A clear, honest "here's what's left" counts in your favour.
+### 5. Publish the registry feed (Terminal C)
 
-## What we look at
+```bash
+just publish        # or: uv run python -m producer.publish
+```
 
-- Does it work, and does it keep working?
-- How you tested it.
-- How you reasoned about your choices and assumptions in `DESIGN.md`.
-- How readable your code is.
+Expected producer output: `published 2518 messages to company-events`.
 
-We don't expect a perfect or complete solution.
+---
 
-## Using AI tools
+## Configuration (Environment Variables)
 
-Go ahead. Tell us in `DESIGN.md` which tools you used and for what. In the interview we'll ask you
-to walk us through your code, so make sure you understand everything you submit.
+All settings have defaults matching `docker-compose.yml` and honor `POSTGRES_PORT`, `RABBITMQ_PORT`, and `RABBITMQ_UI_PORT`:
 
-## After you submit
+| Variable | Default | Notes |
+|---|---|---|
+| `POSTGRES_HOST` | `localhost` | Ignored if `DATABASE_URL` is set |
+| `POSTGRES_PORT` | `5432` | Matches `docker-compose.yml` |
+| `POSTGRES_USER` | `postgres` | |
+| `POSTGRES_PASSWORD` | `postgres` | |
+| `POSTGRES_DB` | `companies` | |
+| `DATABASE_URL` | *(unset)* | Explicit override (e.g. `postgresql://postgres:postgres@localhost:5432/companies`) |
+| `RABBITMQ_HOST` | `localhost` | Ignored if `RABBITMQ_URL` is set |
+| `RABBITMQ_PORT` | `5672` | Matches `docker-compose.yml` and `producer/publish.py` |
+| `RABBITMQ_USER` | `guest` | |
+| `RABBITMQ_PASSWORD` | `guest` | |
+| `RABBITMQ_URL` | *(unset)* | Explicit override (e.g. `amqp://guest:guest@localhost:5672/`) |
+| `RABBITMQ_QUEUE` | `company-events` | Owned by producer (`durable=True`, no extra arguments) |
+| `EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384-dim CPU ONNX multilingual model via `fastembed` |
+| `EMBEDDING_DIM` | `384` | Must match the `vector(384)` column |
+| `CONSUMER_PREFETCH_COUNT` | `16` | RabbitMQ QoS prefetch limit |
+| `MAX_TRANSIENT_RETRIES` | `3` | Bounded retries with exponential backoff before `nack(requeue=True)` |
+| `RETRY_BACKOFF_SECONDS` | `1.0` | Base retry backoff in seconds |
 
-- We review your work as soon as we can.
-- If we move forward, the next interview is a walkthrough of your code with us.
-- Either way, you'll get written feedback by email.
-- Your repo stays yours. Keep it public as a portfolio piece if you like.
+RabbitMQ Management UI is available at `http://localhost:15672` (default credentials `guest` / `guest`, or `RABBITMQ_UI_PORT`).
 
-## About the data
+---
 
-Everything in this repo is synthetic. We generated it for this assessment.
+## API Usage
 
-- The companies, names, registration numbers, descriptions and events are made up. Any resemblance to a real company
-  or person is a coincidence.
-- No OneCredit customer data, credit data or production data is in this repo, and none was used to create it.
-- Registration numbers use a made-up `SYN-` format, so they can't be mistaken for real Companies Commission of
-  Malaysia (SSM) numbers.
-- Your copy is public, so keep secrets, credentials and personal data out of it.
+### Endpoints
+
+- `GET /health` — verifies PostgreSQL connectivity (`200` or `503`).
+- `GET /companies/{registration_number}/similar?limit=5`
+  - Normalizes `registration_number` via `strip().upper()`.
+  - `limit` is validated and bounded to `1..20` (default `5`; invalid values return `422`).
+  - Excludes the query company, `struck_off` companies, and companies with `embedding IS NULL` from semantic candidates; ties in cosine similarity break by same `state`, same `industry`, and `registration_number ASC`.
+  - Each recommendation includes `"matchType": "semantic"` (with cosine `similarity`) or, when a known company lacks a business description but has a real `industry`, `"matchType": "industry_fallback"` with `"similarity": null` (never fabricating cosine scores).
+  - Returns `404` for unknown companies, `200` with `recommendations: []` and an explicit `message` when both description and industry are missing (or no active candidates exist), and `503` if PostgreSQL is unavailable.
+
+### Example `curl` requests & observed output
+
+```bash
+# English coffee shop query
+curl -s 'http://127.0.0.1:8000/companies/SYN-001550/similar?limit=5' | python3 -m json.tool
+```
+
+Observed response after ingesting `data/feed.jsonl`:
+
+```json
+{
+  "registrationNumber": "SYN-001550",
+  "companyName": "Sinar Teguh Bakery Sdn. Bhd.",
+  "industry": "Food & Beverage",
+  "state": "Selangor",
+  "status": "active",
+  "recommendations": [
+    {
+      "registrationNumber": "SYN-000539",
+      "companyName": "Seri Sejahtera Food Sdn. Bhd.",
+      "industry": "Food & Beverage",
+      "state": "Johor",
+      "similarity": 1.0,
+      "matchType": "semantic"
+    },
+    {
+      "registrationNumber": "SYN-000263",
+      "companyName": "Gemilang Delima Food Sdn. Bhd.",
+      "industry": "Food & Beverage",
+      "state": "Johor",
+      "similarity": 0.9497,
+      "matchType": "semantic"
+    },
+    {
+      "registrationNumber": "SYN-001650",
+      "companyName": "Everbright Pacific Food Sdn. Bhd.",
+      "industry": "Food & Beverage",
+      "state": "Kuala Lumpur",
+      "similarity": 0.9497,
+      "matchType": "semantic"
+    },
+    {
+      "registrationNumber": "SYN-000344",
+      "companyName": "Harmoni Maju Kopi Sdn. Bhd.",
+      "industry": "Food & Beverage",
+      "state": "Kedah",
+      "similarity": 0.8618,
+      "matchType": "semantic"
+    },
+    {
+      "registrationNumber": "SYN-000463",
+      "companyName": "Sinar Unity Kopi PLT",
+      "industry": "Food & Beverage",
+      "state": "Kuala Lumpur",
+      "similarity": 0.8618,
+      "matchType": "semantic"
+    }
+  ],
+  "message": null
+}
+```
+
+Additional checks:
+
+```bash
+# Health check
+curl -s http://127.0.0.1:8000/health
+
+# Malay description query ("Hotel butik di Seremban")
+curl -s 'http://127.0.0.1:8000/companies/SYN-000506/similar?limit=5'
+
+# Missing description with real industry (returns 200 with labeled industry_fallback & similarity: null)
+curl -s 'http://127.0.0.1:8000/companies/SYN-000014/similar?limit=3'
+
+# Missing both description and industry (returns 200 with recommendations: [] + explicit message)
+curl -s 'http://127.0.0.1:8000/companies/SYN-000048/similar?limit=3'
+
+# Unknown company (returns 404)
+curl -i 'http://127.0.0.1:8000/companies/SYN-999999/similar'
+```
+
+---
+
+## Verifying Ingestion, Queue Drain & Replay Safety
+
+Check that RabbitMQ has drained completely (`0` ready, `0` unacknowledged):
+
+```bash
+docker compose exec -T rabbitmq rabbitmqctl list_queues -q name messages_ready messages_unacknowledged
+```
+
+Inspect registry coverage, embedding coverage, struck-off status, and quarantined errors in PostgreSQL:
+
+```bash
+docker compose exec -T postgres psql -U postgres -d companies -c "
+SELECT
+  COUNT(*) AS total_companies,
+  COUNT(embedding) AS with_embedding,
+  COUNT(*) FILTER (WHERE embedding IS NULL) AS without_embedding,
+  COUNT(*) FILTER (WHERE status = 'active') AS active_companies,
+  COUNT(*) FILTER (WHERE status = 'struck_off') AS struck_off_companies
+FROM companies;
+SELECT error_type, COUNT(*) FROM ingestion_errors GROUP BY error_type ORDER BY COUNT(*) DESC, error_type;
+"
+```
+
+Observed baseline after ingesting `data/feed.jsonl`:
+- `total_companies = 2000` (`1992` active, `8` struck off)
+- `with_embedding = 1961`, `without_embedding = 39` (`NULL` vectors preserved, zero lost companies)
+- `ingestion_errors = 25` distinct quarantined payloads (covering all 30 invalid messages; 6 identical `null` payloads share one SHA-256 `message_id` and deduplicate cleanly)
+
+To verify **replay safety**, run `just publish` (or `uv run python -m producer.publish`) a second time while the consumer is running: all valid messages short-circuit as `stale_or_duplicate` (`applied=0`), malformed messages hit `ON CONFLICT DO NOTHING`, and all 2,000 company rows and 25 error rows remain identical.
+
+---
+
+## Tests, Linting & Evaluation
+
+Integration tests automatically create and use an isolated `companies_test` database and temporary RabbitMQ queues so they never modify the primary `companies` database or `company-events` queue.
+
+```bash
+# Fast unit tests only (no Docker or model download required)
+uv run pytest -m "not integration" -q
+
+# Full test suite (unit + isolated Postgres/pgvector + FastAPI + RabbitMQ + ONNX smoke test)
+uv run pytest -q
+
+# Linting and formatting checks
+uv run ruff check .
+uv run ruff format --check .
+
+# Optional P2 comparison: multilingual vs. English-only model on active DB catalog
+uv run python -m scripts.eval_models
+
+# Optional scale benchmark: exact cosine vs. pgvector HNSW (2k / 20k / 50k) & ONNX batching
+uv run python -m scripts.benchmark_scale
+```
+
+---
+
+## Shutdown & Clean Reset
+
+- Stop the consumer and API cleanly with `Ctrl+C` (`SIGINT`) or `SIGTERM`.
+- Stop containers while keeping volumes: `docker compose down`
+- Stop containers and **wipe all Postgres/RabbitMQ data** for a clean slate: `just down` (or `docker compose down -v`)
+
+---
+
+## Project Layout
+
+```text
+app/
+  config.py          # env-based configuration (POSTGRES_PORT / RABBITMQ_PORT / URL overrides)
+  schemas.py         # internal event dataclasses and FastAPI Pydantic response schemas
+  normalization.py   # pure parsing, ID/state/timestamp normalization, and version rules
+  embeddings.py      # FastEmbed ONNX CPU wrapper loaded once per consumer worker
+  database.py        # migration runner, connection pool, conditional upserts, pgvector queries
+  consumer.py        # RabbitMQ consumer with commit-before-ACK, quarantine, and bounded backoff
+  api.py             # inference-free FastAPI retrieval service
+migrations/
+  001_initial.sql    # pgvector extension, companies table, ingestion_errors table
+scripts/
+  eval_models.py     # reproducible multilingual vs. English-only retrieval evaluation
+  benchmark_scale.py # reproducible 1x/10x/25x exact-vs-HNSW & ONNX batching benchmark
+tests/
+  conftest.py        # FakeEmbedder and isolated companies_test Postgres fixtures
+  test_normalization.py
+  test_versioning.py
+  test_api.py
+  test_integration.py
+DESIGN.md            # architecture, messy-feed policies, trade-offs, P2 eval, 10x scaling, AI disclosure
+```
